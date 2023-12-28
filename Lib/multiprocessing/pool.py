@@ -16,6 +16,7 @@ __all__ = ['Pool', 'ThreadPool']
 import collections
 import itertools
 import os
+import sys
 import queue
 import threading
 import time
@@ -26,6 +27,7 @@ from queue import Empty
 # If threading is available then ThreadPool should be provided.  Therefore
 # we avoid top-level imports which are liable to fail on some systems.
 from . import util
+from .util import _logger, DEBUG
 from . import get_context, TimeoutError
 from .connection import wait
 
@@ -43,6 +45,7 @@ TERMINATE = "TERMINATE"
 #
 
 job_counter = itertools.count()
+
 
 def mapstar(args):
     return list(map(*args))
@@ -94,13 +97,18 @@ class MaybeEncodingError(Exception):
         return "<%s: %s>" % (self.__class__.__name__, self)
 
 
-def worker(inqueue, outqueue, initializer=None, initargs=(), maxtasks=None,
+def worker(inqueue, outqueue, initializer=None, initargs=(), maxtasks=None,   # 调用方 process.BaseProcess.run()，定义在 _repopulate_pool
            wrap_exception=False):
     if (maxtasks is not None) and not (isinstance(maxtasks, int)
                                        and maxtasks >= 1):
         raise AssertionError("Maxtasks {!r} is not valid".format(maxtasks))
     put = outqueue.put
     get = inqueue.get
+    parent_frame = sys._getframe().f_back
+    util.debug(f"upframe {os.path.basename(parent_frame.f_code.co_filename)}:{parent_frame.f_lineno}")  # 当前方法，当前行
+    util.debug(f"inqueue {type(inqueue)}; outqueue {type(outqueue)}")
+
+    # util.debug(f"inqueue size:{inqueue.qsize()}; size:{outqueue.qsize()}")
     if hasattr(inqueue, '_writer'):
         inqueue._writer.close()
         outqueue._reader.close()
@@ -112,6 +120,8 @@ def worker(inqueue, outqueue, initializer=None, initargs=(), maxtasks=None,
     while maxtasks is None or (maxtasks and completed < maxtasks):
         try:
             task = get()
+            # util.debug(f"get task(job,i,func,args,kwds): {task}")
+            util.debug(f"get task(job,i): {task[:2]}")
         except (EOFError, OSError):
             util.debug('worker got EOFError or OSError -- exiting')
             break
@@ -122,12 +132,16 @@ def worker(inqueue, outqueue, initializer=None, initargs=(), maxtasks=None,
 
         job, i, func, args, kwds = task
         try:
+            util.debug(f"start running task(job,i): {(job,i)}")
             result = (True, func(*args, **kwds))
+            util.debug(f"finish running task(job,i): {(job, i)}")
         except Exception as e:
             if wrap_exception and func is not _helper_reraises_exception:
                 e = ExceptionWithTraceback(e, e.__traceback__)
             result = (False, e)
         try:
+            # util.debug(f"put (job,i,result) to outqueue: {(job, i, result)}")
+            util.debug(f"put (job,i,result) to outqueue: {(job, i)}")
             put((job, i, result))
         except Exception as e:
             wrapped = MaybeEncodingError(e, result[1])
@@ -189,7 +203,7 @@ class Pool(object):
 
         self._ctx = context or get_context()
         self._setup_queues()
-        self._taskqueue = queue.SimpleQueue()
+        self._taskqueue = queue.SimpleQueue()   # qsize=1。除非多次调用.map 或 .imap
         # The _change_notifier queue exist to wake up self._handle_workers()
         # when the cache (self._cache) is empty or when there is a change in
         # the _state variable of the thread that runs _handle_workers.
@@ -232,7 +246,7 @@ class Pool(object):
         self._worker_handler.start()
 
 
-        self._task_handler = threading.Thread(
+        self._task_handler = threading.Thread(    # _quick_put 到 self._inqueue  self._outqueue是干嘛用的？
             target=Pool._handle_tasks,
             args=(self._taskqueue, self._quick_put, self._outqueue,
                   self._pool, self._cache)
@@ -325,7 +339,7 @@ class Pool(object):
             w.daemon = True
             w.start()
             pool.append(w)
-            util.debug('added worker')
+            util.debug(f'added worker {w.name}')
 
     @staticmethod
     def _maintain_pool(ctx, Process, processes, pool, inqueue, outqueue,
@@ -386,7 +400,9 @@ class Pool(object):
         try:
             i = -1
             for i, x in enumerate(iterable):
-                yield (result_job, i, func, (x,), {})
+                util.debug(f"load task(job,i): {(result_job, i)}")   # 为什么这里的func叫 mapstar了？x 却包含了真正的func
+                # util.debug(f"load task(job,i): {(result_job, i, func, (x,), {})}")  # 为什么这里的func叫 mapstar了？x 却包含了真正的func
+                yield (result_job, i, func, (x,), {})   # job, i, func, args, kwds
         except Exception as e:
             yield (result_job, i+1, _helper_reraises_exception, (e,), {})
 
@@ -394,6 +410,7 @@ class Pool(object):
         '''
         Equivalent of `map()` -- can be MUCH slower than `Pool.map()`.
         '''
+        import pdb; pdb.set_trace()
         self._check_running()
         if chunksize == 1:
             result = IMapIterator(self)
@@ -402,6 +419,7 @@ class Pool(object):
                     self._guarded_task_generation(result._job, func, iterable),
                     result._set_length
                 ))
+            util.debug(f"self._taskqueue {type(self._taskqueue)}, size: {self._taskqueue.qsize()}")  # 通常只有1个task，除非多次调用.imap
             return result
         else:
             if chunksize < 1:
@@ -417,6 +435,7 @@ class Pool(object):
                                                   task_batches),
                     result._set_length
                 ))
+            util.debug(f"self._taskqueue {type(self._taskqueue)}, size: {self._taskqueue.qsize()}")  # 通常只有1个task，除非多次调用.imap
             return (item for chunk in result for item in chunk)
 
     def imap_unordered(self, func, iterable, chunksize=1):
@@ -436,16 +455,16 @@ class Pool(object):
             if chunksize < 1:
                 raise ValueError(
                     "Chunksize must be 1+, not {0!r}".format(chunksize))
-            task_batches = Pool._get_tasks(func, iterable, chunksize)
+            task_batches = Pool._get_tasks(func, iterable, chunksize)  #
             result = IMapUnorderedIterator(self)
-            self._taskqueue.put(
+            self._taskqueue.put(    #  self._taskqueue 是给 _handle_tasks 用的
                 (
                     self._guarded_task_generation(result._job,
                                                   mapstar,
                                                   task_batches),
                     result._set_length
                 ))
-            return (item for chunk in result for item in chunk)
+            return (item for chunk in result for item in chunk)   # 这里才开始加载数据 & 多进程处理
 
     def apply_async(self, func, args=(), kwds={}, callback=None,
             error_callback=None):
@@ -506,6 +525,7 @@ class Pool(object):
                         maxtasksperchild, wrap_exception, sentinels,
                         change_notifier):
         thread = threading.current_thread()
+        util.debug('start handle worker')
 
         # Keep maintaining workers until the cache gets drained, unless the pool
         # is terminated.
@@ -522,19 +542,22 @@ class Pool(object):
         util.debug('worker handler exiting')
 
     @staticmethod
-    def _handle_tasks(taskqueue, put, outqueue, pool, cache):
+    def _handle_tasks(taskqueue, put, outqueue, pool, cache):   # 调用方 threading.Thread.run()。线程定义在 self._task_handler
         thread = threading.current_thread()
 
-        for taskseq, set_length in iter(taskqueue.get, None):
+        util.debug(f"taskqueue size = {taskqueue.qsize()}")
+        for taskseq, set_length in iter(taskqueue.get, None):  # 一个taskseq 是 一个job
             task = None
             try:
                 # iterating taskseq cannot fail
                 for task in taskseq:
+                    util.debug(f"start loading task {task[1]}")
                     if thread._state != RUN:
                         util.debug('task handler found thread._state != RUN')
                         break
                     try:
-                        put(task)
+                        util.debug(f"put task {task[1]} to inqueue")
+                        put(task)     # inqueue满了就会阻塞，避免一直读数据而导致OOM。
                     except Exception as e:
                         job, idx = task[:2]
                         try:
@@ -555,7 +578,7 @@ class Pool(object):
 
         try:
             # tell result handler to finish when cache is empty
-            util.debug('task handler sending sentinel to result handler')
+            util.debug('task handler sending sentinel to result handler')   # 啥意思？outqueue 是给resulthandler用的？
             outqueue.put(None)
 
             # tell workers there is no more work
@@ -570,10 +593,11 @@ class Pool(object):
     @staticmethod
     def _handle_results(outqueue, get, cache):
         thread = threading.current_thread()
-
+        # import pdb; pdb.set_trace()
         while 1:
             try:
                 task = get()
+                util.debug(f"handling results for {task}")
             except (OSError, EOFError):
                 util.debug('result handler got EOFError/OSError -- exiting')
                 return
@@ -587,15 +611,16 @@ class Pool(object):
                 util.debug('result handler got sentinel')
                 break
 
-            job, i, obj = task
+            job, i, obj = task   # obj 就是 result
             try:
-                cache[job]._set(i, obj)
+                cache[job]._set(i, obj)  # 将result 存储到 cache中
             except KeyError:
                 pass
             task = job = obj = None
 
         while cache and thread._state != TERMINATE:
             try:
+                util.debug(f"handling results cache for {task}")
                 task = get()
             except (OSError, EOFError):
                 util.debug('result handler got EOFError/OSError -- exiting')
@@ -631,7 +656,7 @@ class Pool(object):
     def _get_tasks(func, it, size):
         it = iter(it)
         while 1:
-            x = tuple(itertools.islice(it, size))
+            x = tuple(itertools.islice(it, size))  # size 就是chunksize，每次读取size条数据作为一个chunk
             if not x:
                 return
             yield (func, x)
